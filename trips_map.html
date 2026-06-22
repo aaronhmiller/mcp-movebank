@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>__TITLE__</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/deck.gl@9.0.36/dist.min.js"></script>
+<style>
+  :root { --ink:#e8eef2; --panel:rgba(16,20,26,.82); --accent:#39c0ed; }
+  html,body { margin:0; height:100%; background:#0a0d12; color:var(--ink);
+    font:14px/1.4 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #map { position:absolute; inset:0; }
+  #panel { position:absolute; top:14px; left:14px; z-index:5; width:300px;
+    background:var(--panel); backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,.08);
+    border-radius:12px; padding:14px 16px; }
+  #panel h1 { font-size:15px; margin:0 0 2px; letter-spacing:.2px; }
+  #clock { font-variant-numeric:tabular-nums; color:var(--accent); font-size:13px; margin-bottom:10px; }
+  .row { display:flex; align-items:center; gap:8px; margin:8px 0; }
+  button { background:#1b2733; color:var(--ink); border:1px solid rgba(255,255,255,.12);
+    border-radius:8px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--accent); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  #legend { margin-top:10px; max-height:170px; overflow:auto; font-size:12px; }
+  .lg { display:flex; align-items:center; gap:7px; margin:3px 0; }
+  .sw { width:11px; height:11px; border-radius:2px; flex:0 0 auto; }
+  .muted { color:#90a0ad; font-size:11px; }
+  label.tog { display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>__TITLE__</h1>
+  <div id="clock">—</div>
+  <div class="row">
+    <button id="play">⏸ Pause</button>
+    <button id="restart">↺ Restart</button>
+  </div>
+  <div class="row"><input id="scrub" type="range" min="0" max="1000" value="0" /></div>
+  <div class="row muted">
+    <span>speed</span>
+    <input id="speed" type="range" min="1" max="200" value="40" style="flex:1" />
+    <span>trail</span>
+    <input id="trail" type="range" min="1" max="100" value="30" style="flex:1" />
+  </div>
+  <div class="row"><label class="tog"><input type="checkbox" id="wxToggle" checked /> precipitation overlay</label></div>
+  <div id="legend"></div>
+</div>
+
+<script>
+const TRIPS   = /*__TRIPS__*/null;
+const WEATHER = /*__WEATHER__*/null;
+
+// ---- Sample data so the file renders standalone (a synthetic looping seabird) ----
+function sampleTrips() {
+  const path=[], ts=[], n=240;
+  for (let i=0;i<n;i++){
+    const u=i/n, ang=u*2*Math.PI;
+    path.push([ -89.6 + 4.5*Math.sin(ang) - 2.0*u, -1.4 + 2.6*Math.sin(2*ang) ]);
+    ts.push(Math.round(u*86400*120*10)/10); // 120 days
+  }
+  const meta={ n_individuals:1, bbox:[-96,-5,-84,3], time_start:"2008-05-31T00:00:00+00:00",
+    time_end:"2008-09-28T00:00:00+00:00", t0_ms:1212192000000, duration_s:86400*120,
+    individuals:[{individual:"SAMPLE-albatross", taxon:"Phoebastria irrorata (demo)",
+      n_points:n, track_km:4200, color_rgb:[57,192,237]}] };
+  return { meta, trips:[{ individual:"SAMPLE-albatross", taxon:"demo",
+    color:[57,192,237], t0_ms:1212192000000, path, timestamps:ts }] };
+}
+
+const data = (TRIPS && TRIPS.trips && TRIPS.trips.length) ? TRIPS : sampleTrips();
+const weather = (WEATHER && WEATHER.cells) ? WEATHER : {cells:[], grid_deg:0.25};
+const DUR = data.meta.duration_s || Math.max(...data.trips.flatMap(t=>t.timestamps));
+const T0  = data.meta.t0_ms || 0;
+const GRID = weather.grid_deg || 0.25;
+
+// Index weather by day -> cells, and find max precip for color scaling.
+const wxByDay = {}; let wxMax = 1;
+for (const c of weather.cells) {
+  (wxByDay[c.date] ||= []).push(c);
+  if (typeof c.precipitation_sum === "number") wxMax = Math.max(wxMax, c.precipitation_sum);
+}
+const dayKey = ms => new Date(ms).toISOString().slice(0,10);
+
+// ---- Basemap (CARTO dark, no API key) ----
+const b = data.meta.bbox;
+const map = new maplibregl.Map({
+  container:"map",
+  style:"https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+  bounds:[[b[0],b[1]],[b[2],b[3]]], fitBoundsOptions:{padding:60}, attributionControl:true
+});
+
+const overlay = new deck.MapboxOverlay({ interleaved:false, layers:[] });
+map.on("load", () => { map.addControl(overlay); animate(); });
+
+// ---- Animation state ----
+let t = 0, playing = true;
+const $ = id => document.getElementById(id);
+
+function precipColor(mm){
+  const x = Math.min(1, mm / wxMax);
+  // transparent->cyan->blue ramp
+  return [ Math.round(20+60*x), Math.round(120+100*x), Math.round(160+95*x), Math.round(140*x) ];
+}
+
+function layers(){
+  const ls = [];
+  if ($("wxToggle").checked && weather.cells.length){
+    const day = dayKey(T0 + t*1000);
+    const cells = wxByDay[day] || [];
+    ls.push(new deck.PolygonLayer({
+      id:"wx", data:cells, stroked:false, filled:true, pickable:false,
+      getPolygon:c => { const h=GRID/2,la=c.lat,lo=c.lon;
+        return [[lo-h,la-h],[lo+h,la-h],[lo+h,la+h],[lo-h,la+h]]; },
+      getFillColor:c => precipColor(c.precipitation_sum||0),
+      updateTriggers:{ getFillColor:[day], getPolygon:[day] }
+    }));
+  }
+  ls.push(new deck.TripsLayer({
+    id:"trips", data:data.trips,
+    getPath:d=>d.path, getTimestamps:d=>d.timestamps, getColor:d=>d.color,
+    opacity:0.85, widthMinPixels:3, rounded:true, fadeTrail:true,
+    trailLength: DUR * (+$("trail").value/100), currentTime:t,
+    updateTriggers:{ trailLength:[$("trail").value] }
+  }));
+  // Leading dot at each animal's current position.
+  ls.push(new deck.ScatterplotLayer({
+    id:"heads", data:data.trips, pickable:true,
+    getPosition:d=>{ let k=0; while(k<d.timestamps.length-1 && d.timestamps[k]<t) k++; return d.path[k]; },
+    getFillColor:d=>d.color, getRadius:5, radiusMinPixels:4, radiusMaxPixels:8,
+    updateTriggers:{ getPosition:[t] }
+  }));
+  return ls;
+}
+
+function render(){
+  overlay.setProps({ layers: layers() });
+  $("clock").textContent = new Date(T0 + t*1000).toISOString().replace("T"," ").slice(0,16)+" UTC";
+  $("scrub").value = Math.round(1000 * t / DUR);
+}
+
+let last = performance.now();
+function animate(){
+  const now = performance.now(), dt = (now-last)/1000; last = now;
+  if (playing){
+    const perSec = DUR / (210 - +$("speed").value); // higher slider = faster
+    t += dt * perSec;
+    if (t > DUR){ t = 0; }
+  }
+  render();
+  requestAnimationFrame(animate);
+}
+
+$("play").onclick   = e => { playing=!playing; e.target.textContent = playing?"⏸ Pause":"▶ Play"; };
+$("restart").onclick= () => { t=0; };
+$("scrub").oninput  = e => { t = DUR * (+e.target.value/1000); playing=false; $("play").textContent="▶ Play"; };
+
+// Legend
+$("legend").innerHTML = data.meta.individuals.map(i=>{
+  const c=i.color_rgb||[150,150,150];
+  return `<div class="lg"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span>`+
+         `<span>${i.individual}</span><span class="muted">${i.track_km||""}${i.track_km?" km":""}</span></div>`;
+}).join("") + (weather.cells.length?`<div class="muted" style="margin-top:6px">precip overlay: ERA5 daily, ${GRID}° grid</div>`:"");
+</script>
+</body>
+</html>
