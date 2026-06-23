@@ -84,3 +84,6 @@ If you want to make a real claim:
 Browse with `list_studies`, but `2911040` (albatrosses) is the reliable no-auth
 starting point. Filter the study list by `taxon_ids` / `name` for storks, vultures,
 geese, etc. — many of the classic long-distance migrants are public.
+
+## What the map can look like
+![map image](mcp_output/mcp-movebank-galapagos-albatross-foraging-tracks.gif)
